@@ -111,7 +111,6 @@ class CMEModule:
             else:
                 self.powershell_exec_method = module_options['PSH_EXEC_METHOD']
 
-        if ''
     def on_admin_login(self, context, connection):
 
         if self.action == 'ADD':
